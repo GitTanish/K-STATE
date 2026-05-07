@@ -46,37 +46,27 @@ K-State introduces a **Decision Layer** built on **LangGraph** that transforms r
 
 > **Knowledge Evaluator** — *The Quality Gate*
 >
-> A dedicated node that scores retrieved document relevance and bifurcates the logic flow based on the **Quality of Truth**:
->
-> | Verdict | Action |
-> |---|---|
-> | **Correct** | Refines context → generates answer |
-> | **Ambiguous** | Triggers hybrid merge of local data + targeted web-search fallback |
-> | **Incorrect** | Rejects local index entirely → activates query-rewriting search agent |
+> A dedicated node that evaluates sentence relevance and keeps only the strips that directly answer the query.
 
-> **Corrective Loop** — *The Safety Net*
+> **Refined Generation** — *The Grounding Step*
 >
-> When local retrieval is insufficient, the system autonomously rewrites the query for web-scale search (Tavily), fetches external context, and injects it back into the generation node.
+> The final answer is generated only from the filtered strips, reducing noise and hallucinations.
 
 ---
 
 ## Architecture & Design Decisions
 
-### 1. Matryoshka-Optimized Semantic Caching
+### 1. Local-First Embedding Runtime
 
-K-State uses **Nomic-v1.5** with Matryoshka embeddings, enabling vector truncation from 768 → 256 dimensions without significant recall loss. The result: a semantic cache that is faster and uses a fraction of the memory footprint of standard implementations.
+All embeddings run locally using **BAAI/bge-small-en-v1.5** via `langchain-huggingface`. This keeps retrieval fast and private while remaining high-quality for small-to-medium corpora.
 
-### 2. Local-First Embedding Runtime
+### 2. State-Machine Orchestration
 
-All embeddings run through local `sentence-transformers` — no external API calls. The "Knowledge Translation" step happens entirely on local compute before any data hits the inference cloud. This eliminates latency and sidesteps privacy risks.
+K-State is a **LangGraph** DAG, not a linear script. Each component — Retrieval, Refinement, Generation — is a modular node, enabling transparent and auditable control flow.
 
-### 3. State-Machine Orchestration
+### 3. Context Refinement
 
-K-State is an **Actor-Model** style DAG, not a linear script. Each component — Evaluation, Rewriting, Searching, Refinement — is a modular node. This enables granular auditing of the system's decision process: transparent engineering-grade tooling, not a black box.
-
-### 4. Context Refinement
-
-Before final generation, a **Decomposition & Filtering** node breaks retrieved documents into individual "knowledge strips," removes irrelevant filler, and feeds only high-density facts to the LLM. This minimizes distractors and ensures strictly grounded output.
+Before final generation, a **Decomposition & Filtering** step breaks retrieved documents into individual "knowledge strips," removes irrelevant filler, and feeds only high-density facts to the LLM.
 
 ---
 
@@ -85,10 +75,9 @@ Before final generation, a **Decomposition & Filtering** node breaks retrieved d
 | Layer | Technology |
 |---|---|
 | **Orchestration** | LangGraph / LangChain |
-| **Local Embeddings** | Nomic-Embed-v1.5 (via Sentence-Transformers) |
-| **Vector Engine** | FAISS-CPU (Cache) & ChromaDB (Index) |
+| **Local Embeddings** | BAAI/bge-small-en-v1.5 (via langchain-huggingface) |
+| **Vector Engine** | FAISS-CPU |
 | **Inference** | Groq |
-| **Search Agent** | DuckDuckGo AI API |
 
 ---
 
