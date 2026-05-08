@@ -9,12 +9,14 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, START, END
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 from typing import List, TypedDict 
 from pydantic import BaseModel
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from ddgs import DDGS
 
 load_dotenv()
 
@@ -77,6 +79,7 @@ class State(TypedDict):
     refined_context: str
     refined_strips: List[str]
     web_docs: List[Document]
+    web_query: str
     answer: str
 
 def retrieve(state):
@@ -148,7 +151,7 @@ def eval_each_doc_node(state: State) -> State:
 def decompose_to_sentences(text: str) -> List[str]:
     text = re.sub(r'\s+', ' ', text).strip()
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if len(s.strip()) >= 5]
+    return [s.strip() for s in sentences if len(s.strip()) >= 25]
 
 # filter
 class KeepOrDrop(BaseModel):
@@ -162,6 +165,36 @@ filter_prompt = ChatPromptTemplate.from_messages(
 )
 filter_chain = filter_prompt | llm.with_structured_output(KeepOrDrop)
 
+# Query Rewrite Node
+class WebQuery(BaseModel):
+    query: str
+
+rewrite_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Rewrite the user question into a web search query composed of keywords.\n"
+            "Rules:\n"
+            "- Keep it short (6-14 words).\n"
+            "- If the question implies recency (e.g., recent/latest/last week/last month), add a constraint like (last 30 days).\n"
+            "- Do NOT answer the question.\n"
+            "- Return JSON with a single key: query",
+        ),
+        ("human", "Question: {question}"),
+    ]
+)
+rewrite_chain = rewrite_prompt | llm | StrOutputParser()
+
+def rewrite_query_node(state: State) -> State:
+    """Rewrite the original question into an optimized web search query."""
+    raw = rewrite_chain.invoke({"question": state["question"]})
+    try:
+        data = json.loads(raw)
+        query = str(data.get("query", "")).strip()
+    except Exception:
+        query = ""
+    return {**state, "web_query": query or state["question"]}
+
 # REFINING (Decompose -> Filter -> Recompose)
 def refine(state: State) -> State:
     q = state["question"]
@@ -169,11 +202,11 @@ def refine(state: State) -> State:
     if state.get("verdict") == "CORRECT":
         source_docs = state.get("good_docs", [])
         context = "\n\n".join(d.page_content for d in source_docs).strip()
-    elif state.get("verdict") == "WEB_SEARCH" or state.get("web_docs"):
-        source_docs = state.get("web_docs", [])
-        context = "\n\n".join(d.page_content for d in source_docs).strip()
     else:
-        context = ""
+        source_docs = state.get("web_docs", [])
+        if state.get("verdict") == "AMBIGUOUS":
+            source_docs = state.get("good_docs", []) + state.get("web_docs", [])
+        context = "\n\n".join(d.page_content for d in source_docs).strip()
 
     if not context:
         return {
@@ -204,34 +237,108 @@ def refine(state: State) -> State:
         "refined_context": refined_context,
     }
 
-# Initialize search tool
-search_tool = DuckDuckGoSearchRun()
+# Initialize search wrapper for structured results
+search_wrapper = DuckDuckGoSearchAPIWrapper(
+    max_results=5,
+    region="wt-wt",
+    safesearch="moderate",
+    time="m",
+    backend="api",
+)
 
 def web_search(state: State) -> State:
-    """Web search using DuckDuckGo (free, no API key)."""
-    question = state["question"]
+    """Structured web search using DuckDuckGo (free, no API key)."""
+    question = state.get("web_query") or state["question"]
+
+    print(f"[Web Search] Original: {state['question']}")
+    print(f"[Web Search] Rewritten: {question}")
 
     try:
-        results = search_tool.invoke(question)
-        web_doc = Document(
-            page_content=results,
-            metadata={"source": "duckduckgo", "query": question}
-        )
-        return {**state, "web_docs": [web_doc], "verdict": "WEB_SEARCH"}
+        raw_results = search_wrapper.results(question, num_results=5)
+        web_docs: List[Document] = []
+
+        for r in raw_results:
+            title = r.get("title", "N/A")
+            url = r.get("link", "N/A")
+            snippet = r.get("snippet", "No content available")
+            formatted_content = f"[SOURCE: {title}]\n{url}\n\n{snippet}"
+            web_docs.append(
+                Document(
+                    page_content=formatted_content,
+                    metadata={
+                        "title": title,
+                        "url": url,
+                        "snippet": snippet,
+                        "source": "duckduckgo",
+                        "original_query": state["question"],
+                        "rewritten_query": question,
+                    },
+                )
+            )
+
+        if web_docs:
+            return {**state, "web_docs": web_docs, "verdict": "WEB_SEARCH"}
+
+        # Fallback if structured API returns empty results.
+        raise RuntimeError("DuckDuckGo API returned zero results")
     except Exception as e:
-        return {
-            **state,
-            "web_docs": [],
-            "verdict": "INCORRECT",
-            "reason": f"Search failed: {e}",
-        }
+        try:
+            web_docs: List[Document] = []
+            with DDGS() as ddgs:
+                results = ddgs.text(
+                    question,
+                    region="wt-wt",
+                    safesearch="moderate",
+                    max_results=5,
+                )
+                for r in results:
+                    title = r.get("title", "N/A")
+                    url = r.get("href", "N/A")
+                    snippet = r.get("body", "No content available")
+                    formatted_content = (
+                        f"TITLE: {title}\n"
+                        f"SOURCE: {url}\n"
+                        f"CONTENT: {snippet}"
+                    )
+                    web_docs.append(
+                        Document(
+                            page_content=formatted_content,
+                            metadata={
+                                "title": title,
+                                "url": url,
+                                "snippet": snippet,
+                                "source": "duckduckgo",
+                                "original_query": state["question"],
+                                "rewritten_query": question,
+                                "fallback": True,
+                            },
+                        )
+                    )
+
+            if web_docs:
+                return {**state, "web_docs": web_docs, "verdict": "WEB_SEARCH"}
+
+            return {
+                **state,
+                "web_docs": [],
+                "verdict": "INCORRECT",
+                "reason": "DuckDuckGo fallback returned zero results",
+            }
+        except Exception as fallback_error:
+            return {
+                **state,
+                "web_docs": [],
+                "verdict": "INCORRECT",
+                "reason": f"Search failed: {e}; fallback failed: {fallback_error}",
+            }
 
 answer_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are a helpful ML tutor. Answer ONLY using the provided refined bullets.\n"
-            "If the bullets are empty or insufficient, say: 'I don't know based on the provided books.'",
+            "You are a helpful ML tutor. Synthesize a concise summary from the context.\n"
+            "If the context contains multiple news items, group them by theme.\n"
+            "If the context is empty or insufficient, say: 'I don't know based on the provided books.'",
         ),
         ("human", "Question: {question}\n\nRefined context:\n{refined_context}"),
     ]
@@ -248,25 +355,20 @@ def generate(state):
 def fail_node(state: State) -> State:
     return {**state, "answer": f"FAIL: {state['reason']}"}
 
-def ambiguous_node(state: State) -> State:
-    return {**state, "answer": f"Ambiguous: {state['reason']}"}
-
 def route_after_eval(state: State) -> str:
     if state["verdict"] == "CORRECT":
         return "refine"
-    elif state["verdict"] == "INCORRECT":
-        return "web_search"
     else:
-        return "ambiguous"
+        return "rewrite_query"
 
 # Build the graph
 g = StateGraph(State)
 g.add_node('retrieve', retrieve)
 g.add_node('eval_each_doc', eval_each_doc_node)
+g.add_node('rewrite_query', rewrite_query_node)
 g.add_node('refine', refine)
 g.add_node('generate', generate)
 g.add_node('fail', fail_node)
-g.add_node('ambiguous', ambiguous_node)
 g.add_node('web_search', web_search)  
 
 g.add_edge(START, 'retrieve')
@@ -276,24 +378,23 @@ g.add_conditional_edges(
     route_after_eval,
     {
         "refine": "refine",
-        "web_search": "web_search",  # FIXED: Was pointing to "fail", now points to actual web_search node
-        "ambiguous": "ambiguous"
+        "rewrite_query": "rewrite_query"
     }
 )
+g.add_edge('rewrite_query', 'web_search')
 g.add_edge('refine', 'generate')
 g.add_edge('web_search', 'refine')  # FIXED: After web search, go to refine
 g.add_edge('generate', END)
 g.add_edge('fail', END)
-g.add_edge('ambiguous', END)  # FIXED: Add edge from ambiguous to END
 
 app = g.compile()
 
 # Run the query
 res = app.invoke(
     {
-        "question": "AI news from the last month.",
+        "question": "Books Launched in 2025?",
         "docs": [],
-        "good_docs": [],
+        "good_docs":  [],
         "verdict": "",
         "reason": "",
         "strips": [],
@@ -301,6 +402,7 @@ res = app.invoke(
         "refined_context": "",
         "refined_strips": [],
         "web_docs": [],
+        "web_query": "",
         "answer": "",
     }
 )
