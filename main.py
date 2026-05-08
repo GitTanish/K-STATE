@@ -13,8 +13,8 @@ from langgraph.graph import StateGraph, START, END
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 from typing import List, TypedDict 
-import re
 from pydantic import BaseModel
+from langchain_community.tools import DuckDuckGoSearchRun
 
 load_dotenv()
 
@@ -61,31 +61,30 @@ else:
 
 
 base_retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={"k": 4})
-llm = ChatGroq( model="openai/gpt-oss-120b", temperature=0)
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
 
 UPPER_TH = 0.7
 LOWER_TH = 0.3
 
 class State(TypedDict):
-    question:str
-    docs : List[Document]
-    good_docs : List[Document]
-    verdict : str
-    reason : str
-    strips : List[str]
-    kept_strips : List[str]
-    refined_context : str
-    refined_strips : List[str]
-    answer : str
+    question: str
+    docs: List[Document]
+    good_docs: List[Document]
+    verdict: str
+    reason: str
+    strips: List[str]
+    kept_strips: List[str]
+    refined_context: str
+    refined_strips: List[str]
+    web_docs: List[Document]
+    answer: str
 
 def retrieve(state):
     q = state['question']
-    # Use 'base_retriever' to fetch relevant documents
     docs = base_retriever.invoke(q)
     return {"docs": docs}
 
-
-# score- based doc eval
+# score-based doc eval
 class DocEvalScore(BaseModel):
     score: float
     reason: str
@@ -111,8 +110,8 @@ doc_eval_chain = doc_eval_prompt | llm.with_structured_output(DocEvalScore)
 def eval_each_doc_node(state: State) -> State:
     q = state["question"]
 
-    scores : List[float] = []
-    reasons : List[str] = []
+    scores: List[float] = []
+    reasons: List[str] = []
     good: List[Document] = []
     for d in state["docs"]:
         out = doc_eval_chain.invoke({"question": q, "chunk": d.page_content})
@@ -127,35 +126,29 @@ def eval_each_doc_node(state: State) -> State:
         "good_docs": good,
     }
 
-    # correct if at least one doc is above UPPER_TH,
-    if any(s> UPPER_TH for s in scores):
+    # correct if at least one doc is above UPPER_TH
+    if any(s > UPPER_TH for s in scores):
         result["verdict"] = "CORRECT"
-        result["reason"] = f"At least one retrieved chunk scored>{UPPER_TH}."
+        result["reason"] = f"At least one retrieved chunk scored > {UPPER_TH}."
         return result
 
     # Incorrect if all docs are below LOWER_TH
-    if len(scores)>0 and all(s < LOWER_TH for s in scores):
-        why= "No chunks was sufficient"
+    if len(scores) > 0 and all(s < LOWER_TH for s in scores):
         result["verdict"] = "INCORRECT"
         result["good_docs"] = []
-        result["reason"] = f"All retrieved chunks scored<{LOWER_TH}. {why}"
+        result["reason"] = f"All retrieved chunks scored < {LOWER_TH}."
         return result
 
     # Anything in between => AMBIGUOUS
-    why = "Mixed relevance signals."
     result["verdict"] = "AMBIGUOUS"
-    result["reason"] = f"Some chunks scored above {LOWER_TH} but none reached {UPPER_TH}. {why}"
+    result["reason"] = f"Some chunks scored above {LOWER_TH} but none reached {UPPER_TH}."
     return result
 
-
-
-
 # sentence level Decomposition
-def decompose_to_sentences(text: str)-> List[str]:
+def decompose_to_sentences(text: str) -> List[str]:
     text = re.sub(r'\s+', ' ', text).strip()
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if len(s.strip())>10]
-
+    return [s.strip() for s in sentences if len(s.strip()) >= 5]
 
 # filter
 class KeepOrDrop(BaseModel):
@@ -170,30 +163,39 @@ filter_prompt = ChatPromptTemplate.from_messages(
 filter_chain = filter_prompt | llm.with_structured_output(KeepOrDrop)
 
 # REFINING (Decompose -> Filter -> Recompose)
-# -----------------------------
 def refine(state: State) -> State:
-
     q = state["question"]
 
-    # Combine retrieved docs into one context string
-    context = "\n\n".join(d.page_content for d in state["good_docs"]).strip()
+    if state.get("verdict") == "CORRECT":
+        source_docs = state.get("good_docs", [])
+        context = "\n\n".join(d.page_content for d in source_docs).strip()
+    elif state.get("verdict") == "WEB_SEARCH" or state.get("web_docs"):
+        source_docs = state.get("web_docs", [])
+        context = "\n\n".join(d.page_content for d in source_docs).strip()
+    else:
+        context = ""
 
-    # 1) DECOMPOSITION: context -> sentence strips
+    if not context:
+        return {
+            **state,
+            "strips": [],
+            "kept_strips": [],
+            "refined_context": "",
+        }
+
     strips = decompose_to_sentences(context)
 
-    # 2) FILTER: keep only relevant strips
     kept: List[str] = []
-    
     for s in strips:
-        res = filter_chain.invoke({"question": q, "sentence": s})
-        keep = getattr(res, "keep", None)
-        if keep is None and isinstance(res, dict):
-            keep = res.get("keep", False)
-        if keep:
+        try:
+            result = filter_chain.invoke({"question": q, "sentence": s})
+            if result.keep:
+                kept.append(s)
+        except Exception:
             kept.append(s)
 
-    # 3) RECOMPOSE: glue kept strips back together (internal knowledge)
-    refined_context = "\n".join(kept).strip()
+    # If the filter is overly strict, fall back to the unfiltered sentences.
+    refined_context = "\n".join(kept).strip() or "\n".join(strips).strip()
 
     return {
         **state,
@@ -202,8 +204,27 @@ def refine(state: State) -> State:
         "refined_context": refined_context,
     }
 
+# Initialize search tool
+search_tool = DuckDuckGoSearchRun()
 
+def web_search(state: State) -> State:
+    """Web search using DuckDuckGo (free, no API key)."""
+    question = state["question"]
 
+    try:
+        results = search_tool.invoke(question)
+        web_doc = Document(
+            page_content=results,
+            metadata={"source": "duckduckgo", "query": question}
+        )
+        return {**state, "web_docs": [web_doc], "verdict": "WEB_SEARCH"}
+    except Exception as e:
+        return {
+            **state,
+            "web_docs": [],
+            "verdict": "INCORRECT",
+            "reason": f"Search failed: {e}",
+        }
 
 answer_prompt = ChatPromptTemplate.from_messages(
     [
@@ -217,21 +238,18 @@ answer_prompt = ChatPromptTemplate.from_messages(
 )
 
 def generate(state):
-    # Use refined_context produced by the refine step
     refined = state.get("refined_context", "")
+    if not refined:
+        return {"answer": "I don't know based on the provided books (Refined context was empty)."}
+
     out = (answer_prompt | llm).invoke({"question": state["question"], "refined_context": refined})
-    ans = getattr(out, "content", None)
-    if ans is None and isinstance(out, dict):
-        ans = out.get("content", str(out))
-    return {"answer": ans}
-
-
+    return {"answer": out.content}
 
 def fail_node(state: State) -> State:
-    return {"answer": f"FAIL: {state['reason']}"}
+    return {**state, "answer": f"FAIL: {state['reason']}"}
 
 def ambiguous_node(state: State) -> State:
-    return {"answer": f"Ambiguous: {state['reason']}"}
+    return {**state, "answer": f"Ambiguous: {state['reason']}"}
 
 def route_after_eval(state: State) -> str:
     if state["verdict"] == "CORRECT":
@@ -241,7 +259,7 @@ def route_after_eval(state: State) -> str:
     else:
         return "ambiguous"
 
-
+# Build the graph
 g = StateGraph(State)
 g.add_node('retrieve', retrieve)
 g.add_node('eval_each_doc', eval_each_doc_node)
@@ -249,6 +267,7 @@ g.add_node('refine', refine)
 g.add_node('generate', generate)
 g.add_node('fail', fail_node)
 g.add_node('ambiguous', ambiguous_node)
+g.add_node('web_search', web_search)  
 
 g.add_edge(START, 'retrieve')
 g.add_edge('retrieve', 'eval_each_doc')
@@ -257,22 +276,22 @@ g.add_conditional_edges(
     route_after_eval,
     {
         "refine": "refine",
-        "web_search": "fail",
+        "web_search": "web_search",  # FIXED: Was pointing to "fail", now points to actual web_search node
         "ambiguous": "ambiguous"
     }
 )
 g.add_edge('refine', 'generate')
+g.add_edge('web_search', 'refine')  # FIXED: After web search, go to refine
 g.add_edge('generate', END)
 g.add_edge('fail', END)
+g.add_edge('ambiguous', END)  # FIXED: Add edge from ambiguous to END
 
 app = g.compile()
 
-
-# 5) Run
-# res = app.invoke({"question": "WHat is a transformer in deep learning.", "docs": [], "answer": ""})
+# Run the query
 res = app.invoke(
     {
-        "question": "Explain the kernel trick in Support Vector Machines and how it allows for linear separation in high-dimensional spaces without explicit feature mapping.",
+        "question": "AI news from the last month.",
         "docs": [],
         "good_docs": [],
         "verdict": "",
@@ -280,6 +299,8 @@ res = app.invoke(
         "strips": [],
         "kept_strips": [],
         "refined_context": "",
+        "refined_strips": [],
+        "web_docs": [],
         "answer": "",
     }
 )
@@ -287,12 +308,3 @@ res = app.invoke(
 print("VERDICT:", res["verdict"])
 print("REASON:", res["reason"])
 print("\nOUTPUT:\n", res["answer"])
-print(res["answer"])
-
-# print(res['docs'][0].page_content)
-# print('*'*100)
-# print(res['docs'][1].page_content)
-# print('*'*100)
-# print(res['docs'][2].page_content)
-# print('*'*100)
-# print(res['docs'][3].page_content)

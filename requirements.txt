@@ -14,5 +14,6 @@ langchain-text-splitters
 langchain-chroma
 langchain-core
 fastapi
+ddgs
 
 
